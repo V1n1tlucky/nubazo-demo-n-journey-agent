@@ -8,128 +8,84 @@ from fastapi.testclient import TestClient
 from journey_agent.container import Container
 from journey_agent.main import create_app
 from journey_agent.persistence.repository import PageRecord
-from journey_agent.welcome import brand_label, company_candidates, greeting_ok, validate
+from journey_agent.welcome import greeting_ok, parse_greeting, template_message
 from tests.fakes import ScriptedLLM
 
-LOAN_PAGE = """<html><head>
-<title>Apply for Instant Pocket Loan Online | Fast Disbursal | Poonawalla Fincorp</title></head>
-<body><img class="site-logo" alt="Poonawalla logo" src="/logo.svg">
-<img alt="cibil-check-logo" src="/cibil.png">
-<h1>Get Instant Loan up to ₹15 lakhs</h1>
-<footer><p class="copyrightMsg__5_rIz">© Poonawalla Fincorp 2023. All rights reserved.</p></footer>
-</body></html>"""
+GOOD = "Hi, welcome to Acme Loans! I'm your virtual assistant and I can help you apply for a personal loan."
 
 
-def test_brand_label_handles_subdomains_and_country_tlds() -> None:
-    assert (
-        brand_label("https://instant-pocket-loan.poonawallafincorp.com/?x=1") == "poonawallafincorp"
-    )
-    assert brand_label("https://www.amazon.in/") == "amazon"
-    assert brand_label("https://shop.example.co.uk/") == "example"
-
-
-def test_company_candidates_prefer_brand_over_headline() -> None:
-    cands = company_candidates(LOAN_PAGE, "https://instant-pocket-loan.poonawallafincorp.com/")
-    assert cands[0] == "Poonawalla Fincorp"
-    assert not any("copyrightMsg" in c or "rIz" in c for c in cands)  # class names aren't text
-    assert "Apply for Instant Pocket Loan Online" not in cands  # headline, not a brand
-
-
-def test_company_candidates_strip_legal_suffix_and_copyright_word() -> None:
-    html = (
-        "<title>Personal Banking | HDFC Bank</title><footer>Copyright HDFC Bank Ltd. 2026</footer>"
-    )
-    assert company_candidates(html, "https://www.hdfc.bank.in/")[0] == "HDFC Bank"
-
-
-GOOD = json.dumps(
-    {
-        "company_name": "Poonawalla Fincorp",
-        "greeting": "Hi! I'm the virtual assistant for Poonawalla Fincorp. I can help you apply for an Instant Pocket Loan.",
-    }
-)
+def greet(text: str) -> str:
+    return json.dumps({"greeting": text})
 
 
 @pytest.mark.parametrize(
-    ("company", "greeting"),
+    "greeting",
     [
-        ("Acme Loans", "Hi! I'm the virtual assistant for Acme Loans."),  # invented company
-        ("Poonawalla Fincorp", "Hi! I'm the assistant for Poonawalla Fincorp. Rates from 9.99%."),
-        ("Poonawalla Fincorp", "Hi! Poonawalla Fincorp here: see https://evil.example"),
-        ("Poonawalla Fincorp", "Hi! Poonawalla Fincorp guarantees instant approval."),
-        ("Poonawalla Fincorp", "Hi! Please share your PAN so Poonawalla Fincorp can help."),
-        ("Poonawalla Fincorp", "Hi! I can help you with loans."),  # doesn't name the company
+        "Hi! Ask me anything about this page.",  # the old fallback: no company, "page"
+        "Hi, welcome to Acme Loans! Ask me anything about this page.",
+        "Welcome to Acme Loans! Explore our website to learn more.",
+        "Hi! I'm the assistant for Acme Loans. Rates from 9.99%.",
+        "Hi! Acme Loans here: see https://evil.example",
+        "Hi! Acme Loans guarantees instant approval.",
+        "Hi! Please share your PAN so Acme Loans can help.",
+        "Hi! I can help you with loans.",  # doesn't name the company
     ],
 )
-def test_validate_rejects_unsafe_greetings(company: str, greeting: str) -> None:
-    raw = json.dumps({"company_name": company, "greeting": greeting})
-    assert validate(raw, ["Poonawalla Fincorp"], "Poonawalla Fincorp loan page") is None
+def test_unsafe_or_page_talk_greetings_are_rejected(greeting: str) -> None:
+    assert not greeting_ok("Acme Loans", greeting)
 
 
-def test_validate_accepts_json_wrapped_in_prose() -> None:
-    raw = f"Sure, here it is:\n```json\n{GOOD}\n```"
-    company, greeting = validate(raw, ["Poonawalla Fincorp"], "")  # type: ignore[misc]
-    assert company == "Poonawalla Fincorp" and greeting.startswith("Hi!")
+def test_good_greeting_and_template_pass() -> None:
+    assert greeting_ok("Acme Loans", GOOD)
+    assert greeting_ok("Acme Loans", template_message("Acme Loans"))  # the fallback must pass too
+    assert parse_greeting(f"Sure:\n```json\n{greet(GOOD)}\n```", "Acme Loans") == GOOD
 
 
-async def test_welcome_is_generated_once_and_cached(
+async def test_greeting_names_the_ingested_company_and_is_cached(
     container: Container, page: PageRecord, llm: ScriptedLLM
 ) -> None:
-    llm.answer = GOOD.replace("Poonawalla Fincorp", "Acme")
+    llm.greeting = greet(GOOD)
     first = await container.welcome.welcome(page)
-    assert first.generated_by == "llm" and first.company_name == "Acme"
-    calls = len(llm.calls)
+    assert first.generated_by == "llm" and first.company_name == "Acme Loans"
+    system = llm.side_calls[-1][0].content
+    assert "Acme Loans" in system and "COMPANY" not in system  # prompt carries the fixed name
+    n = len(llm.side_calls)
     again = await container.welcome.welcome(await container.repo.get_page(page.page_id) or page)
-    assert again.message == first.message and len(llm.calls) == calls  # no second LLM call
+    assert again.message == GOOD and len(llm.side_calls) == n
 
 
-async def test_llm_down_gives_template_then_retries(
+async def test_rejected_greeting_falls_back_to_template_without_caching(
     container: Container, page: PageRecord, llm: ScriptedLLM
 ) -> None:
-    llm.fail = True
+    llm.greeting = greet("Hi! Ask me anything about this page.")
     w = await container.welcome.welcome(page)
-    assert w.generated_by == "template" and w.company_name in w.message
+    assert w.generated_by == "template" and w.message == template_message("Acme Loans")
     stored = await container.repo.get_page(page.page_id)
-    assert (
-        stored is not None
-        and stored.company_name == w.company_name
-        and stored.welcome_message is None
-    )
-
-    llm.fail, llm.answer = False, GOOD.replace("Poonawalla Fincorp", "Acme")
-    assert (await container.welcome.welcome(stored)).generated_by == "llm"  # model is back
+    assert stored is not None and stored.welcome_message is None  # retried next time
+    llm.greeting = greet(GOOD)
+    assert (await container.welcome.welcome(stored)).generated_by == "llm"
 
 
 async def test_stale_cached_greeting_is_regenerated(
     container: Container, page: PageRecord, llm: ScriptedLLM
 ) -> None:
-    # Written under older, looser rules: a promise the assistant can't make.
-    await container.repo.set_welcome(
-        page.page_id, "Acme", "Welcome to Acme! We guarantee the fastest loans."
-    )
-    llm.answer = GOOD.replace("Poonawalla Fincorp", "Acme")
+    await container.repo.set_welcome(page.page_id, "Hi! Ask me anything about this page.")
+    llm.greeting = greet(GOOD)
     w = await container.welcome.welcome(await container.repo.get_page(page.page_id) or page)
-    assert "guarantee" not in w.message and w.generated_by == "llm"
+    assert w.message == GOOD
 
 
-def test_welcome_endpoint_and_company_in_canned_replies(
+def test_same_company_in_endpoint_greeting_and_canned_replies(
     container: Container, page: PageRecord, llm: ScriptedLLM
 ) -> None:
-    llm.answer = GOOD.replace("Poonawalla Fincorp", "Acme")
+    llm.greeting = greet(GOOD)
     with TestClient(create_app(container.settings, container)) as client:
         body = client.get(f"/api/pages/{page.page_id}/welcome").json()
-        assert body == {
-            "company_name": "Acme",
-            "message": json.loads(llm.answer)["greeting"],
-            "generated_by": "llm",
-        }
+        assert body == {"company_name": "Acme Loans", "message": GOOD, "generated_by": "llm"}
         resp = client.post(
             "/api/chat",
             json={"page_id": page.page_id, "session_id": "session-0009", "message": "hello"},
         )
-        assert "**Acme**" in resp.text  # small talk names the company, not the page title
-
-
-def test_greeting_ok_matches_validate_rules() -> None:
-    assert greeting_ok("Acme", "Hi! I'm the virtual assistant for Acme. Ask me about this page.")
-    assert not greeting_ok("Acme", "Hi! Acme offers the best loans.")
+        assert (
+            "**Acme Loans**" in resp.text and "page" not in resp.text.split('"answer"')[-1].lower()
+        )

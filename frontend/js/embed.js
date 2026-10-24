@@ -25,8 +25,8 @@ const chat = createChat({
       : await api.lookup(params.get("url") ?? "");
     $("title").textContent = page.company_name || page.title;
     chat.setPage(page);
-    api.theme(page.page_id).then((t) => applyChatTheme(document.body, t.theme_color), () => {});
+    api.theme(page.page_id).then((t) => applyChatTheme(document.body, t.palette ?? [t.theme_color]), () => {});
   } catch {
-    $("message-input").placeholder = "This page hasn't been set up for the assistant yet.";
+    $("message-input").placeholder = "The assistant isn't available here yet.";
   }
 })();

@@ -12,6 +12,16 @@ from dataclasses import dataclass, field
 
 from journey_agent.ingestion.models import Chunk, PageDocument, Section, SourceType
 
+_WORD = re.compile(r"\b[A-Za-z][a-z]{2,}\b")  # "loan", "Apply"; not "n5vB", "lyq58WwxX"
+
+
+def low_signal(text: str) -> bool:
+    """Chunks with almost no natural-language words: encrypted payloads ("iv: n5vB+gfF…"),
+    layout debris ("$ /$"). They rank high on cosine by accident and crowd real content
+    out of the candidate pool."""
+    return len(_WORD.findall(text)) < 3
+
+
 _BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n")
 _SEP = " › "
 
@@ -68,6 +78,8 @@ def chunk_document(doc: PageDocument, *, size: int, overlap: int) -> list[Chunk]
     out: list[Chunk] = []
     for group in _pack(doc.sections):
         for piece in _split("\n".join(group.lines), size, overlap):
+            if low_signal(piece):
+                continue  # opaque payload values, layout debris
             out.append(
                 Chunk(
                     id=f"{doc.page_id}:{len(out)}",

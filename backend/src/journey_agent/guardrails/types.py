@@ -11,6 +11,8 @@ class Verdict(StrEnum):
     PASS = "pass"  # noqa: S105 - verdict, not a credential
     MODIFIED = "modified"  # text was changed (e.g. PII redacted) but allowed
     BLOCK = "block"
+    SKIPPED = "skipped"  # an LLM judge that couldn't run (model down, unparseable reply)
+    FLAG = "flag"  # a signal for a later node, not a decision (judge: "unrelated")
 
 
 class Check(BaseModel):

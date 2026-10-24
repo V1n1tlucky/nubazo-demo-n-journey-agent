@@ -107,7 +107,7 @@ export function createChat({ api, messagesEl, suggestionsEl, formEl, inputEl, se
     setPage(next) {
       page = next;
       messagesEl.replaceChildren();
-      inputEl.placeholder = "Ask about this page…";
+      inputEl.placeholder = "Type your message…";
       setEnabled(true);
       renderSuggestions(next.topics ?? []);
       // The greeting is LLM-written once per page on the server; show typing until it lands.
@@ -116,15 +116,16 @@ export function createChat({ api, messagesEl, suggestionsEl, formEl, inputEl, se
       bubble.setAttribute("aria-label", "Assistant is typing");
       bubble.innerHTML = "<span></span><span></span><span></span>";
       api.welcome(next.page_id)
-        .catch(() => ({ company_name: next.title, message: "Hi! Ask me anything about this page." }))
+        .catch(() => ({ company_name: "", message: "Hi! I'm your virtual assistant. How can I help you today?" }))
         .then((w) => {
           if (page !== next) return; // another page was opened meanwhile
           bubble.classList.remove("typing");
           bubble.removeAttribute("aria-label");
           // renderMarkdown escapes first, so bolding the name this way is safe.
-          bubble.innerHTML = renderMarkdown(w.message.replace(w.company_name, `**${w.company_name}**`));
+          const text = w.company_name ? w.message.replace(w.company_name, `**${w.company_name}**`) : w.message;
+          bubble.innerHTML = renderMarkdown(text);
           scroll();
-          hooks.onWelcome?.(w);
+          if (w.company_name) hooks.onWelcome?.(w);
         });
     },
     send,

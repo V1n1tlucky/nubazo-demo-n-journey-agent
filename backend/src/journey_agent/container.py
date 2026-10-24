@@ -71,7 +71,7 @@ async def build_container(
     llm = llm or make_llm(settings)
     reranker = reranker or make_reranker(settings)
     registry = IndexRegistry(settings.index_dir, embedder)
-    ingestion = IngestionService(settings, registry, repo)
+    ingestion = IngestionService(settings, registry, repo, llm)
     graph = build_graph(AgentDeps(settings, registry, embedder, llm, repo, reranker))
     welcome = WelcomeService(repo, llm, registry, ingestion)
     log.info(

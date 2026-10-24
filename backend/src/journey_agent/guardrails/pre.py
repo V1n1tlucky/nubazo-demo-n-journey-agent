@@ -1,8 +1,9 @@
 """Input guardrails, run before any retrieval or LLM call.
 
-All checks are deterministic and sub-millisecond. An LLM-as-judge pre-check
-would roughly double latency on a laptop-class model for limited gain; the
-page-relevance gate (in the retrieval node) and post-checks cover the rest.
+These checks are deterministic and sub-millisecond. Messages they let through
+then go to the LLM input judge (llm_judge.py, in the pre_guardrail node), which
+catches what patterns can't: paraphrased injection, politely worded harmful
+requests, unrelated questions. guardrails/policy.py describes every check.
 """
 
 from __future__ import annotations
@@ -35,24 +36,25 @@ _SMALLTALK = re.compile(
 )
 _ABUSE = re.compile(r"\b(fuck|bitch|bastard|asshole|motherf\w*)\b", re.IGNORECASE)
 
+# Customer-facing: the assistant speaks for the company and never refers to "the page".
 REFUSAL_INJECTION = (
-    "I can only help with questions about this page, and I can't change how I work. "
-    "What would you like to know about it?"
+    "I'm sorry, I can't help with that, and I can't change how I work. How can I help you today?"
 )
-REFUSAL_ABUSE = "Let's keep things respectful. How can I help you with this page?"
+REFUSAL_ABUSE = "Let's keep things respectful. How can I help you today?"
+REFUSAL_HARMFUL = "I'm sorry, I can't help with that. Is there something else I can help you with?"
 
 
-def smalltalk_reply(text: str, page_title: str, topics: list[str]) -> str:
+def smalltalk_reply(text: str, company: str, topics: list[str]) -> str:
     if re.search(r"thank", text, re.IGNORECASE):
-        return "You're welcome! Anything else about this page I can help with?"
+        return "You're welcome! Is there anything else I can help you with?"
     if re.search(r"bye", text, re.IGNORECASE):
-        return "Goodbye! Come back any time."
-    hint = f" For example: {'; '.join(t.rstrip('.') for t in topics[:3])}." if topics else ""
-    return f"Hi! I'm the assistant for **{page_title}**, here to help with this page.{hint}"
+        return f"Goodbye, and thank you for visiting {company}!"
+    hint = f" I can help with: {'; '.join(t.rstrip('.') for t in topics[:3])}." if topics else ""
+    return f"Hi! I'm the virtual assistant for **{company}**. How can I help you today?{hint}"
 
 
 def run_pre_guardrails(
-    text: str, *, max_chars: int, page_title: str, topics: list[str]
+    text: str, *, max_chars: int, company: str, topics: list[str]
 ) -> GuardrailResult:
     checks: list[Check] = []
     stripped = text.strip()
@@ -63,7 +65,7 @@ def run_pre_guardrails(
             text=text,
             checks=checks,
             route="blocked",
-            blocked_reply="Please type a question about this page.",
+            blocked_reply="Please type your question.",
         )
     checks.append(Check(name="non_empty", verdict=Verdict.PASS))
 
@@ -113,7 +115,7 @@ def run_pre_guardrails(
             text=redacted,
             checks=checks,
             route="smalltalk",
-            blocked_reply=smalltalk_reply(redacted, page_title, topics),
+            blocked_reply=smalltalk_reply(redacted, company, topics),
         )
 
     return GuardrailResult(text=redacted, checks=checks)

@@ -14,9 +14,8 @@ const state = {
   trace: {}, // node id -> latest NodeTrace
   expanded: new Set(), // node ids whose details are open; a finished run opens all of them
   run: null, // { status: "running" | route, run_id } for the latest turn
-  theme: null, // the loaded page's brand colour (#rrggbb) or null
+  theme: [], // the loaded page's brand palette, primary first
   persona: null, // edited persona, null = default
-  promptTab: "system_prompt",
 };
 
 // --- notices -------------------------------------------------------------------
@@ -44,11 +43,6 @@ async function refreshHealth() {
 }
 
 // --- LangGraph pane ---------------------------------------------------------------
-const PROMPT_PARTS = [
-  ["system_prompt", "system"],
-  ["retrieval_context", "retrieval"],
-  ["payload_inputs", "payload"],
-];
 
 const order = () => state.config.nodes.map((n) => n.id);
 const nodeStatus = (t) => t?.status ?? t?.ui ?? "idle";
@@ -124,9 +118,45 @@ function renderRunBar() {
   $("run-bar").replaceChildren(...stats.filter(Boolean)); // replaceChildren would print null as text
 }
 
-function checksView(checks = []) {
-  return el("div", { class: "checks" }, checks.map((c) =>
-    el("div", { class: "check" }, el("b", {}, c.name), el("span", { class: `badge ${c.verdict}` }, c.verdict), el("span", {}, c.detail || ""))));
+// Every check of a guardrail stage: its rule (from /api/config) beside the live verdict.
+function policyView(stage, checks = []) {
+  const live = Object.fromEntries(checks.map((c) => [c.name, c]));
+  const rules = state.config.guardrails?.[stage] ?? [];
+  const known = new Set(rules.map((r) => r.name));
+  const rows = [
+    ...rules.map((r) => ({ ...r, ...(live[r.name] ?? {}) })),
+    ...checks.filter((c) => !known.has(c.name)), // anything the policy doesn't list yet
+  ];
+  return el("div", { class: "checks" }, rows.map((r) =>
+    el("div", { class: `check rule ${r.verdict ? "" : "not-run"}` },
+      el("b", {}, r.name),
+      el("span", { class: `badge ${r.verdict ?? "idle"}` }, r.verdict ?? "not run"),
+      el("span", { class: `kind ${r.kind ?? ""}` }, r.kind ?? ""),
+      el("span", { class: "rule-text" }, r.rule ?? "", r.detail ? el("span", { class: "rule-detail" }, ` → ${r.detail}`) : null))));
+}
+
+// The LLM judge of a stage: the exact prompt sent and its raw reply, or the template.
+function judgeView(stage, judge, ran) {
+  const g = state.config.guardrails ?? {};
+  const title = el("p", { class: "eyebrow mt" }, stage === "pre" ? "LLM input judge" : "LLM output judge");
+  if (!g.llm_guardrails) {
+    return el("div", {}, title, el("p", { class: "desc" }, "Disabled (JA_LLM_GUARDRAILS=false). Prompt template:"),
+      el("pre", { class: "code" }, g.judge_prompts?.[stage] ?? ""));
+  }
+  if (!judge) {
+    return el("div", {}, title,
+      el("p", { class: "desc" }, ran
+        ? "Not run on this turn: a deterministic check had already decided. Prompt template (COMPANY is filled in):"
+        : "Prompt template (COMPANY is filled in per page; the live prompt appears after a run):"),
+      el("pre", { class: "code" }, g.judge_prompts?.[stage] ?? ""));
+  }
+  return el("div", {}, title,
+    el("p", { class: "summary" },
+      el("span", { class: `badge ${judge.verdict === "allow" ? "pass" : judge.verdict}` }, judge.verdict),
+      ` ${judge.category ? `${judge.category} · ` : ""}${judge.reason || "—"} · ${ms(judge.latency_ms)} · ${judge.input_tokens}+${judge.output_tokens} tokens`),
+    ...judge.prompt.map((m) => el("div", {}, el("p", { class: "desc prompt-role" }, `${m.role} prompt`), el("pre", { class: "code" }, m.content))),
+    el("p", { class: "desc prompt-role" }, "raw response"),
+    el("pre", { class: "code" }, judge.raw_response || "(no response)"));
 }
 
 function hitsView(title, hits = []) {
@@ -145,40 +175,33 @@ function kvView(obj) {
 }
 
 function promptBuilderView(details) {
-  const tabs = el("div", { class: "subtabs" }, PROMPT_PARTS.map(([key, label]) =>
-    el("button", {
-      class: `subtab ${state.promptTab === key ? "active" : ""}`, type: "button",
-      onclick: () => { state.promptTab = key; renderNode("prompt_builder"); },
-    }, label)));
-
-  let body;
-  if (state.promptTab === "system_prompt") {
-    const editable = state.config.allow_prompt_override;
-    const area = el("textarea", { class: "code", spellcheck: "false", readonly: !editable });
-    area.value = state.persona ?? state.config.default_persona;
-    body = el("div", {},
-      el("p", { class: "desc" }, editable
-        ? "Persona (editable — applies to your next message). {title} and {url} are filled in from the page."
-        : "Persona (editing disabled by server config)."),
-      area,
-      editable ? el("div", { class: "row-actions" },
-        el("button", { class: "btn btn-primary btn-sm", type: "button", onclick: () => {
-          state.persona = area.value.trim() === state.config.default_persona ? null : area.value;
-          notify("Persona updated for the next message.", "ok");
-          setTimeout(clearNotice, 2000);
-        } }, "Apply"),
-        el("button", { class: "btn btn-outline btn-sm", type: "button", onclick: () => { state.persona = null; renderNode("prompt_builder"); } }, "Reset")) : null,
-      el("p", { class: "eyebrow mt" }, "Locked grounding rules (always appended)"),
-      el("pre", { class: "code" }, state.config.grounding_rules),
-      details?.system_prompt ? el("p", { class: "eyebrow mt" }, "Rendered system prompt (last run)") : null,
-      details?.system_prompt ? el("pre", { class: "code" }, details.system_prompt) : null);
-  } else {
-    const text = details?.[state.promptTab];
-    body = el("pre", { class: "code" }, text || (details ? "(empty for this run)" : "Run a message to see this part of the prompt."));
-  }
-  const stats = details ? el("p", { class: "summary" },
-    `~${details.estimated_prompt_tokens} tokens · ${details.history_turns} history turns · reply in ${details.reply_language ?? "—"} · chunks ${details.chunks_used.join(", ") || "none"}`) : null;
-  return el("div", {}, tabs, stats, body);
+  const editable = state.config.allow_prompt_override;
+  const area = el("textarea", { class: "code", spellcheck: "false", readonly: !editable });
+  area.value = state.persona ?? state.config.default_persona;
+  const part = (label, text) => [
+    el("p", { class: "eyebrow mt" }, label),
+    el("pre", { class: "code" }, text || (details ? "(empty for this run)" : "Run a message to see this part of the prompt.")),
+  ];
+  return el("div", {},
+    details ? el("p", { class: "summary" },
+      `~${details.estimated_prompt_tokens} tokens · ${details.history_turns} history turns · reply in ${details.reply_language ?? "—"} · chunks ${details.chunks_used.join(", ") || "none"}`) : null,
+    el("p", { class: "eyebrow" }, "System prompt · persona"),
+    el("p", { class: "desc" }, editable
+      ? "Editable — applies to your next message. {company} (LLM-identified), {title} and {url} are filled in."
+      : "Editing disabled by server config."),
+    area,
+    editable ? el("div", { class: "row-actions" },
+      el("button", { class: "btn btn-primary btn-sm", type: "button", onclick: () => {
+        state.persona = area.value.trim() === state.config.default_persona ? null : area.value;
+        notify("Persona updated for the next message.", "ok");
+        setTimeout(clearNotice, 2000);
+      } }, "Apply"),
+      el("button", { class: "btn btn-outline btn-sm", type: "button", onclick: () => { state.persona = null; renderNode("prompt_builder"); } }, "Reset")) : null,
+    el("p", { class: "eyebrow mt" }, "System prompt · locked grounding rules (always appended)"),
+    el("pre", { class: "code" }, state.config.grounding_rules),
+    details?.system_prompt ? part("System prompt · rendered (last run)", details.system_prompt) : null,
+    ...part("Retrieval context · <page_content>", details?.retrieval_context),
+    ...part("Payload inputs · <page_data>", details?.payload_inputs));
 }
 
 function writeNodeView(details) {
@@ -196,10 +219,13 @@ function nodeDetails(node, t) {
   let body = null;
   switch (node.id) {
     case "pre_guardrail":
-      body = d ? el("div", {}, checksView(d.checks),
-        el("p", { class: "eyebrow mt" }, `Text forwarded (PII-redacted) · reply in ${d.reply_language ?? "—"}`),
-        el("pre", { class: "code" }, d.redacted_input)) : null;
-      break;
+      // Rules and the judge prompt are shown even before a run, so the policy is inspectable.
+      return el("div", {},
+        el("p", { class: "eyebrow" }, "Checks · rule → live verdict"),
+        policyView("pre", d?.checks),
+        judgeView("pre", d?.llm_judge, Boolean(d)),
+        d ? el("p", { class: "eyebrow mt" }, `Text forwarded (PII-redacted) · reply in ${d.reply_language ?? "—"}`) : null,
+        d ? el("pre", { class: "code" }, d.redacted_input) : null);
     case "retrieve":
       body = d ? el("div", {}, el("p", { class: "summary" }, `query: “${d.query}” · ${d.gate ?? "cosine"} threshold ${d.threshold}`),
         hitsView("Page content", d.content_hits), hitsView("Response payloads", d.payload_hits)) : null;
@@ -218,8 +244,12 @@ function nodeDetails(node, t) {
         el("pre", { class: "code" }, d.raw_answer ?? d.error)) : null;
       break;
     case "post_guardrail":
-      body = d ? el("div", {}, checksView(d.checks), el("p", { class: "eyebrow mt" }, "Text released"), el("pre", { class: "code" }, d.final_text)) : null;
-      break;
+      return el("div", {},
+        el("p", { class: "eyebrow" }, "Checks · rule → live verdict"),
+        policyView("post", d?.checks),
+        judgeView("post", d?.llm_judge, Boolean(d)),
+        d ? el("p", { class: "eyebrow mt" }, "Text released") : null,
+        d ? el("pre", { class: "code" }, d.final_text ?? "") : null);
     case "write":
       body = d ? writeNodeView(d) : null;
       break;
@@ -242,7 +272,7 @@ function renderMascot() {
   const still = reducedMotion();
   launcherAnim = window.lottie.loadAnimation({
     container: $("bot-anim"), renderer: "svg", loop: true, autoplay: !still && $("chat-shell").hidden,
-    animationData: state.theme ? tintAnimation(JSON.parse(mascotJson), state.theme) : JSON.parse(mascotJson),
+    animationData: tintAnimation(JSON.parse(mascotJson), state.theme),
   });
   if (still) launcherAnim.goToAndStop(20, true); // a frame with the bubbles in view
 }
@@ -261,21 +291,23 @@ async function mountLauncherAnimation() {
 }
 
 async function loadTheme(page) {
-  state.theme = null;
-  applyChatTheme($("bot"), null);
+  state.theme = [];
+  applyChatTheme($("bot"), []);
   $("page-theme").hidden = true;
-  let color = null;
+  let palette = [];
   try {
-    color = (await api.theme(page.page_id)).theme_color;
+    const t = await api.theme(page.page_id);
+    palette = t.palette ?? (t.theme_color ? [t.theme_color] : []);
   } catch { /* keep the console defaults */ }
   if (state.page?.page_id !== page.page_id) return; // another page was opened meanwhile
-  state.theme = color;
-  applyChatTheme($("bot"), color);
+  state.theme = palette;
+  applyChatTheme($("bot"), palette);
   renderMascot();
-  if (color) {
-    $("page-theme").hidden = false;
-    $("page-theme").title = `Assistant themed to the page's brand colour ${color}`;
-    $("page-theme").style.setProperty("--swatch", color);
+  if (palette.length) {
+    const swatch = $("page-theme");
+    swatch.replaceChildren(...palette.map((c) => el("span", { class: "swatch-dot", style: `--swatch: ${c}` })));
+    swatch.title = `Assistant themed to the page's palette: ${palette.join(", ")} (primary first)`;
+    swatch.hidden = false;
   }
 }
 
@@ -393,6 +425,7 @@ $("ingest-form").addEventListener("submit", (e) => {
       await openPage(await api.ingest($("url-input").value));
     } catch (err) {
       if (err.code === "needs_upload") needsUpload(err.message);
+      else if (err.code === "llm_unavailable") notify(`<b>Company identification needs the model server.</b> ${escapeHtml(err.message)}`, "error");
       else notify(escapeHtml(err.message), "error");
     }
   });

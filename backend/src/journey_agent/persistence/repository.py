@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS pages (
     topics        TEXT NOT NULL DEFAULT '[]',
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL,
-    theme_color   TEXT,  -- NULL = not computed yet, '' = computed, none found
+    theme_color   TEXT,  -- primary brand colour; NULL = not computed yet, '' = none found
+    theme_palette TEXT,  -- comma-separated #rrggbb, primary first (ingestion/theme.py)
     company_name  TEXT,  -- detected brand name (welcome.py)
     welcome_message TEXT  -- LLM-written greeting; NULL until generated
 );
@@ -76,8 +77,9 @@ class PageRecord(BaseModel):
     topics: list[str] = Field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
-    theme_color: str | None = None  # page's brand colour (#rrggbb); see ingestion/theme.py
-    company_name: str | None = None  # detected brand name; see welcome.py
+    theme_color: str | None = None  # page's primary brand colour (#rrggbb); ingestion/theme.py
+    theme_palette: str | None = None  # "#a,#b,#c", primary first; None = not computed yet
+    company_name: str | None = None  # LLM-identified at ingestion; see company.py
     welcome_message: str | None = None  # LLM-written greeting, cached per page
 
 
@@ -130,7 +132,7 @@ class Repository:
             conn.executescript(SCHEMA)
             # Additive migrations for databases created before these columns existed.
             cols = {r["name"] for r in conn.execute("PRAGMA table_info(pages)")}
-            for col in ("theme_color", "company_name", "welcome_message"):
+            for col in ("theme_color", "theme_palette", "company_name", "welcome_message"):
                 if col not in cols:
                     # Names come from the literal tuple above, never from input.
                     conn.execute(f"ALTER TABLE pages ADD COLUMN {col} TEXT")
@@ -144,14 +146,16 @@ class Repository:
         with closing(self._connect()) as conn, conn:
             conn.execute(
                 """INSERT INTO pages (page_id, url, title, description, fetched_with,
-                       chunk_count, char_count, payload_count, topics, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                       chunk_count, char_count, payload_count, topics, created_at, updated_at,
+                       company_name)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(page_id) DO UPDATE SET
                        title=excluded.title, description=excluded.description,
                        fetched_with=excluded.fetched_with, chunk_count=excluded.chunk_count,
                        char_count=excluded.char_count, payload_count=excluded.payload_count,
                        topics=excluded.topics, updated_at=excluded.updated_at,
-                       theme_color=NULL, company_name=NULL, welcome_message=NULL
+                       company_name=excluded.company_name,
+                       theme_color=NULL, theme_palette=NULL, welcome_message=NULL
                        -- re-ingested: the page may have been restyled or reworded
                    """,
                 (
@@ -166,6 +170,7 @@ class Repository:
                     json.dumps(page.topics),
                     now,
                     now,
+                    page.company_name,
                 ),
             )
 
@@ -182,22 +187,28 @@ class Repository:
         )
         return PageRecord(**rows[0]) if rows else None
 
-    def _set_theme_sync(self, page_id: str, color: str) -> None:
+    async def set_theme(self, page_id: str, palette: list[str]) -> None:
+        await asyncio.to_thread(
+            self._update_sync,
+            page_id,
+            theme_color=palette[0] if palette else "",
+            theme_palette=",".join(palette),
+        )
+
+    def _update_sync(self, page_id: str, **cols: str | None) -> None:
+        # Column names come from the keyword arguments below, never from input.
+        sets = ", ".join(f"{k}=?" for k in cols)
         with closing(self._connect()) as conn, conn:
-            conn.execute("UPDATE pages SET theme_color=? WHERE page_id=?", (color, page_id))
+            conn.execute(f"UPDATE pages SET {sets} WHERE page_id=?", (*cols.values(), page_id))  # noqa: S608
 
-    async def set_theme_color(self, page_id: str, color: str) -> None:
-        await asyncio.to_thread(self._set_theme_sync, page_id, color)
+    async def set_company(self, page_id: str, company: str) -> None:
+        """A new company name also invalidates the greeting that named the old one."""
+        await asyncio.to_thread(
+            self._update_sync, page_id, company_name=company, welcome_message=None
+        )
 
-    def _set_welcome_sync(self, page_id: str, company: str, message: str | None) -> None:
-        with closing(self._connect()) as conn, conn:
-            conn.execute(
-                "UPDATE pages SET company_name=?, welcome_message=? WHERE page_id=?",
-                (company, message, page_id),
-            )
-
-    async def set_welcome(self, page_id: str, company: str, message: str | None) -> None:
-        await asyncio.to_thread(self._set_welcome_sync, page_id, company, message)
+    async def set_welcome(self, page_id: str, message: str) -> None:
+        await asyncio.to_thread(self._update_sync, page_id, welcome_message=message)
 
     async def find_page_by_url(self, url: str) -> PageRecord | None:
         rows = await asyncio.to_thread(self._query, "SELECT * FROM pages WHERE url=?", (url,))

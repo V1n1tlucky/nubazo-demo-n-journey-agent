@@ -7,6 +7,7 @@ graph is unit-testable with fake LLMs/embedders.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -16,8 +17,16 @@ from journey_agent.config import Settings
 from journey_agent.graph import prompts
 from journey_agent.graph.state import AgentState, NodeTrace
 from journey_agent.guardrails.language import reply_language
-from journey_agent.guardrails.post import run_post_guardrails
-from journey_agent.guardrails.pre import run_pre_guardrails
+from journey_agent.guardrails.llm_judge import JudgeResult, judge_input, judge_output
+from journey_agent.guardrails.post import FALLBACK, run_post_guardrails
+from journey_agent.guardrails.pre import (
+    REFUSAL_ABUSE,
+    REFUSAL_HARMFUL,
+    REFUSAL_INJECTION,
+    run_pre_guardrails,
+)
+from journey_agent.guardrails.types import Check, Verdict
+from journey_agent.ingestion.chunker import low_signal
 from journey_agent.ingestion.models import SourceType
 from journey_agent.llm.client import ChatModel, Message, estimate_tokens
 from journey_agent.persistence.repository import Repository, RunRecord
@@ -87,6 +96,40 @@ def _hit_dict(hit: Hit, rerank: float | None = None) -> dict[str, Any]:
     }
 
 
+def _topics(state: AgentState) -> list[str]:
+    # Pages without headings fall back to their title as the only "topic"; never offer that.
+    title = state["page_title"].strip().lower()
+    return [t for t in state.get("topics", []) if t.strip().lower() != title]
+
+
+def _judge_check(name: str, judge: JudgeResult, *, flag: bool = False) -> dict[str, Any]:
+    verdict = {"block": Verdict.BLOCK, "skipped": Verdict.SKIPPED}.get(judge.verdict, Verdict.PASS)
+    detail = f"{judge.category}: {judge.reason}" if judge.category else judge.reason
+    if flag:  # judged unrelated: a signal for the retrieval gate, not a refusal
+        verdict, detail = Verdict.FLAG, f"{detail} (relevance decided by retrieval)"
+    return Check(name=name, verdict=verdict, detail=detail).model_dump()
+
+
+# Messages that only make sense as a reply to the previous turn.
+_FOLLOW_UP = re.compile(
+    r"^\s*(yes|yeah|yep|yup|ok(ay)?|sure|please|and|also|but|so|then|what about|how about|"
+    r"tell me more|more|go on|continue|it|its|it's|that|this|those|these|they|them|same|why)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_follow_up(message: str) -> bool:
+    """Short is not the same as follow-up: "how do I apply?" stands alone. Context from the
+    previous turn or the greeting is only added for replies ("yes, tell me the process",
+    "and if I'm self-employed?") or fragments of three words or fewer."""
+    return bool(_FOLLOW_UP.match(message)) or len(message.split()) <= 3
+
+
+def _previous_assistant(state: AgentState, history: list[tuple[str, str]]) -> str:
+    """What the customer may be replying to: the last answer, or the greeting at the start."""
+    return history[-1][1] if history else state.get("greeting", "")
+
+
 def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
     s = deps.settings
 
@@ -95,28 +138,59 @@ def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
         result = run_pre_guardrails(
             state["user_message"],
             max_chars=s.max_input_chars,
-            page_title=state.get("company_name") or state["page_title"],
-            topics=state.get("topics", []),
+            company=state["company_name"],
+            topics=_topics(state),
         )
         checks = [c.model_dump() for c in result.checks]
         history = await deps.repo.session_history(
             state["session_id"], state["page_id"], s.history_turns
         )
         language = reply_language(result.text, s.reply_languages)
+        route, reply = result.route, result.blocked_reply
+        judge: JudgeResult | None = None
+        relevance: str | None = None  # the judge's on_topic/unrelated call, for the retrieve gate
+        if route == "continue" and s.llm_guardrails:  # only what regex already let through
+            judge = await judge_input(
+                deps.llm,
+                company=state["company_name"],
+                offering=f"{state['page_title']}. {state.get('page_description', '')}".strip(),
+                topics=_topics(state),
+                previous=_previous_assistant(state, history),
+                message=result.text,
+            )
+            safety = {
+                "prompt_injection": REFUSAL_INJECTION,
+                "abusive": REFUSAL_ABUSE,
+                "harmful": REFUSAL_HARMFUL,
+            }
+            if judge.blocked and judge.category in safety:
+                route, reply = "blocked", safety[judge.category]
+                checks.append(_judge_check("llm_input_judge", judge))
+            else:
+                # Relevance is not the judge's to refuse alone: two independent gates double
+                # the wrong refusals ("tell me about gold loan" on a gold-loan lender's site).
+                # Retrieval decides, and uses this call only to break a tie.
+                if judge.verdict != "skipped":
+                    relevance = "unrelated" if judge.blocked else "on_topic"
+                checks.append(_judge_check("llm_input_judge", judge, flag=judge.blocked))
         update = {
             "clean_message": result.text,
             "reply_language": language,
-            "route": result.route,
-            "canned_reply": result.blocked_reply,
+            "route": route,
+            "canned_reply": reply,
             "pre_checks": checks,
             "history": history,
+            "judge_relevance": relevance,
         }
-        status = "blocked" if result.route == "blocked" else "ok"
-        failed = [c.name for c in result.checks if c.verdict != "pass"]
-        summary = f"{result.route}" + (
-            f" · {', '.join(failed)}" if failed else " · all checks passed"
-        )
-        details = {"checks": checks, "redacted_input": result.text, "reply_language": language}
+        status = "blocked" if route in {"blocked", "off_topic"} else "ok"
+        failed = [c["name"] for c in checks if c["verdict"] != "pass"]
+        summary = f"{route}" + (f" · {', '.join(failed)}" if failed else " · all checks passed")
+        details = {
+            "checks": checks,
+            "redacted_input": result.text,
+            "reply_language": language,
+            "llm_judge": judge.details() if judge else None,
+        }
         return update, status, summary, details
 
     @traced("retrieve")
@@ -129,48 +203,103 @@ def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
                 "no index for page — re-ingest",
                 {},
             )
-        query = state["clean_message"]
+        question = state["clean_message"]
         history = state.get("history", [])
-        # Short follow-ups ("how much is it?") need the previous turn to retrieve well.
-        if history and len(query.split()) < 8:
-            query = f"{history[-1][0]} {query}"
-        qvec = await deps.embedder.embed_query(query)
-        content = index.search(
-            qvec, k=s.top_k_content, sources={SourceType.CONTENT, SourceType.META}
+        # Context for short follow-ups ("and if self-employed?", "yes, tell me the process"):
+        # the previous question, or the greeting the customer is replying to.
+        context = history[-1][0] if history else state.get("greeting", "")
+        variants = [question]
+        if context and _is_follow_up(question):
+            variants.append(f"{context} {question}")
+        use_rerank = deps.reranker is not None and state["reply_language"] in s.reranker_languages
+
+        # FAISS proposes a pool (pool x top_k); junk chunks are dropped; the cross-encoder
+        # picks the best. Cosine ranking alone buries the right chunk under noise.
+        best: dict[str, tuple[Hit, float | None]] = {}
+        tried: list[str] = []
+        for q in variants:
+            tried.append(q)
+            qvec = await deps.embedder.embed_query(q)
+            pool = index.search(
+                qvec,
+                k=s.top_k_content * s.candidate_pool,
+                sources={SourceType.CONTENT, SourceType.META},
+            ) + index.search(
+                qvec, k=s.top_k_payload * s.candidate_pool, sources={SourceType.PAYLOAD}
+            )
+            pool = [h for h in pool if not low_signal(h.chunk.text)]
+            scores: list[float | None] = [None] * len(pool)
+            if use_rerank and pool and deps.reranker is not None:
+                scores = list(
+                    await deps.reranker.score(
+                        q, [f"{h.chunk.heading}\n{h.chunk.text}" for h in pool]
+                    )
+                )
+            for h, r in zip(pool, scores, strict=True):
+                prev = best.get(h.chunk.id)
+                if prev is None or (r if r is not None else h.score) > (
+                    prev[1] if prev[1] is not None else prev[0].score
+                ):
+                    best[h.chunk.id] = (h, r)
+            gate_now = max(
+                ((r if r is not None else h.score) for h, r in best.values()), default=-99.0
+            )
+            if gate_now >= (s.rerank_threshold if use_rerank else s.relevance_threshold):
+                break  # the question as asked is clearly answerable; no need for context
+
+        ranked = sorted(
+            best.values(), key=lambda hr: hr[1] if hr[1] is not None else hr[0].score, reverse=True
         )
-        payload = index.search(qvec, k=s.top_k_payload, sources={SourceType.PAYLOAD})
-        hits = content + payload
-        top = max((h.score for h in hits), default=0.0)
-        # Cosine can't separate on- from off-page questions; the cross-encoder can, in the
-        # languages it was trained on.
-        if deps.reranker is not None and hits and state["reply_language"] in s.reranker_languages:
-            texts = [f"{h.chunk.heading}\n{h.chunk.text}" for h in hits]
-            scores = await deps.reranker.score(query, texts)
-            reranks: list[float | None] = [*scores]
-            gate, threshold, gate_name = max(scores), s.rerank_threshold, "rerank"
+        content = [hr for hr in ranked if hr[0].chunk.source is not SourceType.PAYLOAD][
+            : s.top_k_content
+        ]
+        payload = [hr for hr in ranked if hr[0].chunk.source is SourceType.PAYLOAD][
+            : s.top_k_payload
+        ]
+        top = max((h.score for h, _ in ranked), default=0.0)
+        judge = state.get("judge_relevance")
+        if use_rerank:
+            gate = max((r for _, r in ranked if r is not None), default=-99.0)
+            soft, hard, gate_name = s.rerank_threshold, s.rerank_hard_threshold, "rerank"
+            if gate >= soft:
+                relevant, why = True, f"≥ {soft}"
+            elif gate < hard:
+                relevant, why = False, f"< {hard} (off-page)"
+            elif judge == "on_topic":
+                relevant, why = True, f"grey zone [{hard}, {soft}), LLM judge: on_topic"
+            else:
+                relevant, why = (
+                    False,
+                    f"grey zone [{hard}, {soft}), LLM judge: {judge or 'n/a'} (off-page)",
+                )
         else:
-            reranks = [None] * len(hits)
-            gate, threshold, gate_name = top, s.relevance_threshold, "cosine"
-        relevant = gate >= threshold
-        dicts = [_hit_dict(h, r) for h, r in zip(hits, reranks, strict=True)]
+            gate, soft, hard, gate_name = (
+                top,
+                s.relevance_threshold,
+                s.relevance_threshold,
+                "cosine",
+            )
+            relevant = gate >= soft
+            why = f"≥ {soft}" if relevant else f"< {soft} (off-page)"
         update: dict[str, Any] = {
-            "content_hits": dicts[: len(content)],
-            "payload_hits": dicts[len(content) :],
+            "content_hits": [_hit_dict(h, r) for h, r in content],
+            "payload_hits": [_hit_dict(h, r) for h, r in payload],
             "top_score": top,
         }
         if not relevant:
             update["route"] = "off_topic"
-            update["canned_reply"] = prompts.off_topic_reply(
-                state.get("company_name") or state["page_title"], state.get("topics", [])
-            )
+            update["canned_reply"] = prompts.off_topic_reply(state["company_name"], _topics(state))
         summary = (
-            f"{len(content)} content + {len(payload)} payload chunks · {gate_name} {gate:.2f}"
-            + ("" if relevant else f" < {threshold} (off-page)")
+            f"{len(content)} content + {len(payload)} payload chunks · {gate_name} {gate:.2f} {why}"
         )
         details = {
-            "query": query,
+            "query": tried[-1],
+            "queries_tried": tried,
             "gate": gate_name,
-            "threshold": threshold,
+            "threshold": soft,
+            "hard_threshold": hard if use_rerank else None,
+            "judge_relevance": judge,
+            "decision": why,
             "content_hits": update["content_hits"],
             "payload_hits": update["payload_hits"],
         }
@@ -182,7 +311,7 @@ def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
         if s.allow_prompt_override and state.get("persona_override"):
             persona = state["persona_override"] or persona
         system = prompts.build_system_prompt(
-            persona, title=state["page_title"], url=state["page_url"]
+            persona, company=state["company_name"], title=state["page_title"], url=state["page_url"]
         )
 
         budget = s.max_context_chars
@@ -197,7 +326,12 @@ def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
             used.append(hit["id"])
             budget -= len(block)
         for hit in state.get("payload_hits", []):
-            if hit["score"] < s.relevance_threshold:
+            weak = (
+                hit["rerank"] < s.rerank_threshold
+                if hit.get("rerank") is not None
+                else hit["score"] < s.relevance_threshold
+            )
+            if weak:
                 continue  # weak payload matches are noise for a small model
             block = f"[{len(used) + 1}] source: {hit['origin']}\n{hit['text']}"
             if len(block) > budget:
@@ -208,6 +342,10 @@ def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
 
         content_block, data_block = "\n\n".join(content_parts), "\n\n".join(data_parts)
         messages = [{"role": "system", "content": system}]
+        greeting = state.get("greeting", "")
+        if greeting and len(state.get("history", [])) < s.history_turns:
+            # The conversation's real opening: "yes, please" may be a reply to it.
+            messages.append({"role": "assistant", "content": greeting})
         for user, ai in state.get("history", []):
             messages += [{"role": "user", "content": user}, {"role": "assistant", "content": ai}]
         messages.append(
@@ -283,7 +421,7 @@ def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
             question=state["clean_message"],
             reply_language=state["reply_language"],
             embedder=deps.embedder,
-            grounding_threshold=s.grounding_threshold,
+            grounding_threshold=s.grounding_floor if s.llm_guardrails else s.grounding_threshold,
         )
         checks = [c.model_dump() for c in result.checks]
         update: dict[str, Any] = {
@@ -291,23 +429,41 @@ def make_nodes(deps: AgentDeps) -> dict[str, NodeFn]:
             "grounding_score": score,
             "answer": result.text,
         }
+        blocked = result.blocked
         if result.route == "off_topic":
             update["route"] = "off_topic"
-            update["canned_reply"] = prompts.off_topic_reply(
-                state.get("company_name") or state["page_title"], state.get("topics", [])
-            )
+            update["canned_reply"] = prompts.off_topic_reply(state["company_name"], _topics(state))
         elif result.blocked:
             update["route"] = "fallback"
             update["canned_reply"] = result.blocked_reply
-        failed = [c.name for c in result.checks if c.verdict != "pass"]
+        judge: JudgeResult | None = None
+        if not blocked and s.llm_guardrails:  # only answers the deterministic checks released
+            judge = await judge_output(
+                deps.llm,
+                company=state["company_name"],
+                question=state["clean_message"],
+                answer=result.text,
+                contexts=contexts,
+            )
+            checks.append(_judge_check("llm_output_judge", judge))
+            if judge.blocked:
+                blocked = True
+                update["route"] = "fallback"
+                update["canned_reply"] = FALLBACK
+        update["post_checks"] = checks
+        failed = [c["name"] for c in checks if c["verdict"] != "pass"]
         summary = f"grounding {score:.2f}" + (
             f" · {', '.join(failed)}" if failed else " · all checks passed"
         )
         return (
             update,
-            "blocked" if result.blocked else "ok",
+            "blocked" if blocked else "ok",
             summary,
-            {"checks": checks, "final_text": result.text},
+            {
+                "checks": checks,
+                "final_text": update.get("canned_reply") if blocked else result.text,
+                "llm_judge": judge.details() if judge else None,
+            },
         )
 
     @traced("write")

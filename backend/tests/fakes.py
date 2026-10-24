@@ -74,19 +74,48 @@ class FixedReranker:
 
 
 class ScriptedLLM:
+    """Answers the main question with `answer`; side prompts get canned JSON.
+
+    Side prompts (company identification, LLM guardrail judges, greeting) are
+    routed by their system prompt and recorded in `side_calls`, so `calls` keeps
+    meaning "the answer-generation call" in assertions like `llm.calls == []`.
+    """
+
     model = "fake-llm"
 
     def __init__(self, answer: str = "", *, fail: bool = False) -> None:
         self.answer = answer
         self.fail = fail
+        self.company = "Acme Loans"
+        self.input_verdict = '{"verdict": "allow", "category": "on_topic", "reason": "about loans"}'
+        self.output_verdict = '{"verdict": "pass", "reason": "grounded in the context"}'
+        self.greeting: str | None = None  # None: answer the greeting prompt with `answer`
         self.calls: list[list[Message]] = []
+        self.side_calls: list[list[Message]] = []
+
+    def _side_reply(self, system: str) -> str | None:
+        if "You identify the company" in system:
+            return f'{{"company_name": "{self.company}"}}'
+        if "You screen customer messages" in system:
+            return self.input_verdict
+        if "You review the answer" in system:
+            return self.output_verdict
+        if "first message a customer sees" in system and self.greeting is not None:
+            return self.greeting
+        return None
 
     async def complete(self, messages: list[Message]) -> Completion:
-        self.calls.append(messages)
+        system = messages[0].content if messages and messages[0].role == "system" else ""
+        side = self._side_reply(system)
+        (self.calls if side is None else self.side_calls).append(messages)
         if self.fail:
             raise ConnectionError("model server down")
         return Completion(
-            self.answer, input_tokens=123, output_tokens=45, model=self.model, latency_ms=12.0
+            side if side is not None else self.answer,
+            input_tokens=123,
+            output_tokens=45,
+            model=self.model,
+            latency_ms=12.0,
         )
 
     async def health(self) -> bool:

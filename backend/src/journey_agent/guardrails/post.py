@@ -34,10 +34,7 @@ _ABSTAIN = re.compile(
     r"|नहीं मिल|जानकारी नहीं|उपलब्ध नहीं",  # Hindi: "didn't find", "no information", "not available"
     re.IGNORECASE,
 )
-FALLBACK = (
-    "I couldn't find a reliable answer to that on this page. "
-    "Could you rephrase, or ask about something shown on the page?"
-)
+FALLBACK = "I'm sorry, I don't have a reliable answer to that. Could you rephrase your question?"
 
 
 def abstains(answer: str) -> bool:

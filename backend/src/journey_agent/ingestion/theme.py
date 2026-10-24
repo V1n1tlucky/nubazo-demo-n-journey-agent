@@ -1,11 +1,16 @@
 """The brand colour of an ingested page, so the assistant can wear the page's theme.
 
 The stored snapshot is rendered in headless Chromium (its stylesheets load; its
-scripts are already stripped) and the colours a visitor actually sees are
-sampled: button/CTA backgrounds weighted by area, header/nav backgrounds, link
-and heading colours, and `<meta name="theme-color">`. Greys, near-white and
-near-black are ignored and the heaviest hue wins. Without Chromium, a cheaper
-pass reads the meta tag and inline CSS instead.
+scripts are already stripped) and two kinds of evidence are combined:
+
+* CSS colours of what matters most: button/CTA backgrounds weighted by area,
+  header/nav backgrounds, link and heading colours, `<meta name="theme-color">`;
+* the rendered pixels of the logo(s), where brand palettes live, often in images
+  or SVG that CSS sampling can't see. Nothing else is pixel-sampled: hero photos
+  would add skin tones, and text in a header band adds anti-aliasing noise.
+
+Greys, near-white and near-black are ignored; the heaviest distinct hues form
+the palette. Without Chromium, a cheaper pass reads the meta tag and inline CSS.
 """
 
 from __future__ import annotations
@@ -13,9 +18,13 @@ from __future__ import annotations
 import asyncio
 import colorsys
 import contextlib
+import io
 import logging
 import re
 from collections import defaultdict
+
+import numpy as np
+from PIL import Image
 
 from journey_agent.ingestion.url_safety import assert_public_url
 
@@ -62,6 +71,54 @@ _SAMPLE_JS = r"""
 }
 """
 
+# Bounding boxes of logo-like elements near the top: anything marked logo/brand, or an
+# image/SVG inside the header, nav or home link.
+_LOGO_RECTS_JS = r"""
+() => {
+  const text = (el) => [el.getAttribute("class"), el.id, el.getAttribute("alt"),
+                        el.getAttribute("src"), el.getAttribute("aria-label")].join(" ");
+  const branded = (el) => /logo|brand/i.test(text(el));
+  const inHeader = (el) => !!el.closest('header, nav, a[href="/"], a[href="./"], [class*=brand i], [class*=logo i]');
+  const out = [];
+  for (const el of document.querySelectorAll("img, svg, [class*=logo i], [id*=logo i]")) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 16 || r.height < 10 || r.width > 600 || r.top > 300 || r.bottom < 0) continue;
+    const media = el.tagName === "IMG" || el.tagName.toLowerCase() === "svg";
+    if (!(branded(el) || (media && inHeader(el)))) continue;
+    // Clamp to the viewport: off-canvas menus put logos partly off-screen.
+    const x = Math.max(0, r.left), y = Math.max(0, r.top);
+    const w = Math.min(innerWidth, r.right) - x, h = Math.min(innerHeight, r.bottom) - y;
+    if (w < 8 || h < 8) continue;
+    out.push({ x, y, width: w, height: h });
+    if (out.length >= 4) break;
+  }
+  return out;
+}
+"""
+LOGO_WEIGHT = 40.0  # total for all logos; a large CTA weighs about 22
+
+
+def pixel_samples(png: bytes, weight: float) -> list[tuple[str, float]]:
+    """Brand-like colours in a screenshot, sharing `weight` by how many pixels each covers.
+
+    Only clearly saturated pixels count, so a small logo on lots of white still speaks
+    clearly; pale anti-aliasing blends and dull textured backgrounds don't.
+    """
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    if img.width > 200:
+        img = img.resize((200, max(1, round(200 * img.height / img.width))), Image.Resampling.BOX)
+    colors, freq = np.unique(np.asarray(img).reshape(-1, 3), axis=0, return_counts=True)
+    counts: dict[RGB, int] = {}
+    for (r, g, b), n in zip(colors.tolist(), freq.tolist(), strict=True):
+        _, lightness, sat = _hls((r, g, b))
+        if _is_brand_like((r, g, b)) and sat >= 0.45 and lightness <= 0.75:
+            counts[(r, g, b)] = n
+    total = sum(counts.values())
+    if not total:
+        return []
+    return [(f"rgb({r}, {g}, {b})", weight * n / total) for (r, g, b), n in counts.items()]
+
+
 _RGB_FN = re.compile(
     r"rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:\s*[,/]\s*([\d.]+%?))?\s*\)"
 )
@@ -101,30 +158,54 @@ def _is_brand_like(rgb: RGB) -> bool:
     return s >= 0.25 and 0.15 <= lightness <= 0.85
 
 
-def pick_theme(samples: list[tuple[str, float]]) -> str | None:
-    """The heaviest saturated hue among weighted colour samples, as `#rrggbb`."""
-    buckets: dict[int, float] = defaultdict(float)
+def _hls(rgb: RGB) -> tuple[float, float, float]:
+    return colorsys.rgb_to_hls(*(c / 255 for c in rgb))
+
+
+def _cluster(rgb: RGB) -> tuple[int, int]:
+    h, lightness, _ = _hls(rgb)
+    return int(h * 24) % 24, min(int(lightness / 0.15), 6)  # 15° hue x 0.15 lightness cells
+
+
+def _distinct(a: RGB, b: RGB) -> bool:
+    """Different palette colours: 20°+ apart in hue (maroon vs orange) or clearly lighter/darker."""
+    ha, la, _ = _hls(a)
+    hb, lb, _ = _hls(b)
+    hue_gap = min(abs(ha - hb), 1 - abs(ha - hb)) * 360
+    return hue_gap >= 20 or abs(la - lb) >= 0.2
+
+
+def pick_palette(samples: list[tuple[str, float]], size: int = 3) -> list[str]:
+    """Up to `size` distinct brand colours, heaviest first, as `#rrggbb`.
+
+    Near-identical shades merge into one entry; a colour carrying under 8% of the
+    primary's weight is a stray badge, not part of the palette.
+    """
+    cells: dict[tuple[int, int], float] = defaultdict(float)
     exact: dict[RGB, float] = defaultdict(float)
     for value, weight in samples:
         rgb = parse_color(value)
         if rgb is None or not _is_brand_like(rgb):
             continue
-        hue = colorsys.rgb_to_hls(*(c / 255 for c in rgb))[0]
-        buckets[int(hue * 24) % 24] += weight  # 15° hue bins
+        cells[_cluster(rgb)] += weight
         exact[rgb] += weight
-    if not buckets:
-        return None
-    best = max(buckets, key=lambda b: buckets[b])
-    in_bucket = {
-        rgb: w
-        for rgb, w in exact.items()
-        if int(colorsys.rgb_to_hls(*(c / 255 for c in rgb))[0] * 24) % 24 == best
-    }
-    r, g, b = max(in_bucket, key=lambda c: in_bucket[c])
-    return f"#{r:02x}{g:02x}{b:02x}"
+    chosen: list[tuple[RGB, float]] = []
+    for cell in sorted(cells, key=lambda c: -cells[c]):
+        if len(chosen) == size or (chosen and cells[cell] < 0.08 * chosen[0][1]):
+            break
+        rep = max((rgb for rgb in exact if _cluster(rgb) == cell), key=lambda c: exact[c])
+        if all(_distinct(rep, other) for other, _ in chosen):
+            chosen.append((rep, cells[cell]))
+    return [f"#{r:02x}{g:02x}{b:02x}" for (r, g, b), _ in chosen]
 
 
-def theme_from_html(html: str) -> str | None:
+def pick_theme(samples: list[tuple[str, float]]) -> str | None:
+    """The heaviest saturated hue among weighted colour samples, as `#rrggbb`."""
+    palette = pick_palette(samples, size=1)
+    return palette[0] if palette else None
+
+
+def theme_from_html(html: str) -> list[str]:
     """Fallback without a browser: meta theme-color, then colours in inline CSS."""
     samples: list[tuple[str, float]] = []
     if m := _META.search(html):
@@ -133,10 +214,10 @@ def theme_from_html(html: str) -> str | None:
         css = block.group(1) or block.group(2) or ""
         samples += [(c.group(0), 1) for c in _HEX.finditer(css)]
         samples += [(c.group(0), 1) for c in _RGB_FN.finditer(css)]
-    return pick_theme(samples)
+    return pick_palette(samples)
 
 
-async def theme_from_snapshot(html: str, *, timeout_s: float, allow_private: bool) -> str | None:
+async def theme_from_snapshot(html: str, *, timeout_s: float, allow_private: bool) -> list[str]:
     """Render the sanitised snapshot and sample its on-screen colours."""
     from playwright.async_api import async_playwright
 
@@ -159,7 +240,19 @@ async def theme_from_snapshot(html: str, *, timeout_s: float, allow_private: boo
             # Stylesheets matter; a slow font or image shouldn't block the answer.
             with contextlib.suppress(Exception):
                 await page.wait_for_load_state("networkidle", timeout=5000)
-            samples = await page.evaluate(_SAMPLE_JS)
+            samples = [(str(c), float(w)) for c, w in await page.evaluate(_SAMPLE_JS)]
+            with contextlib.suppress(Exception):  # logo images must have loaded to be sampled
+                await page.wait_for_function(
+                    "[...document.images].every((i) => i.complete)", timeout=4000
+                )
+            logos: list[list[tuple[str, float]]] = []
+            for rect in (await page.evaluate(_LOGO_RECTS_JS))[:4]:
+                with contextlib.suppress(Exception):  # an element that vanished, etc.
+                    shot = await page.screenshot(type="png", clip=rect)
+                    if found := pixel_samples(shot, 1.0):
+                        logos.append(found)
+            for found in logos:  # the logo weight is shared only by logos that had colour
+                samples += [(c, w * LOGO_WEIGHT / len(logos)) for c, w in found]
         finally:
             await browser.close()
-    return pick_theme([(str(c), float(w)) for c, w in samples])
+    return pick_palette(samples)

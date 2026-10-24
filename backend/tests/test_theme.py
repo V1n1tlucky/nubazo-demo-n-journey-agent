@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from journey_agent.container import Container
 from journey_agent.ingestion import service
-from journey_agent.ingestion.theme import parse_color, pick_theme, theme_from_html
+from journey_agent.ingestion.theme import parse_color, pick_palette, pick_theme, theme_from_html
 from journey_agent.main import create_app
 from journey_agent.persistence.repository import PageRecord, Repository
 
@@ -45,9 +45,25 @@ def test_pick_theme_none_when_only_greys() -> None:
 
 
 def test_theme_from_html_reads_meta_and_inline_css() -> None:
-    assert theme_from_html('<meta name="theme-color" content="#0fb48c">') == "#0fb48c"
+    assert theme_from_html('<meta name="theme-color" content="#0fb48c">') == ["#0fb48c"]
     html = '<style>.btn{background:#d98a00}</style><a style="color:#d98a00">x</a>'
-    assert theme_from_html(html) == "#d98a00"
+    assert theme_from_html(html) == ["#d98a00"]
+
+
+def test_palette_keeps_distinct_brand_colours_heaviest_first() -> None:
+    samples = [
+        ("rgb(255, 98, 0)", 30),  # orange CTA
+        ("rgb(250, 105, 10)", 6),  # same orange, another shade: merges
+        ("rgb(33, 98, 161)", 12),  # link blue
+        ("rgb(174, 40, 46)", 8),  # maroon: ~26° from orange, a different palette colour
+        ("rgb(16, 200, 120)", 1),  # stray badge: under 8% of the primary
+        ("#ffffff", 90),
+    ]
+    assert pick_palette(samples) == ["#ff6200", "#2162a1", "#ae282e"]
+
+
+def test_palette_of_a_single_hue_brand_is_one_colour() -> None:
+    assert pick_palette([("#243970", 20), ("#263b72", 10), ("#f4f4f4", 50)]) == ["#243970"]
 
 
 def test_repository_migrates_old_pages_table(tmp_path: Path) -> None:
@@ -62,7 +78,7 @@ def test_repository_migrates_old_pages_table(tmp_path: Path) -> None:
     Repository(db)._init_sync()
     with sqlite3.connect(db) as conn:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(pages)")}
-    assert "theme_color" in cols
+    assert {"theme_color", "theme_palette", "company_name", "welcome_message"} <= cols
 
 
 async def test_theme_endpoint_computes_once_and_reingest_resets(
@@ -73,10 +89,11 @@ async def test_theme_endpoint_computes_once_and_reingest_resets(
     path.write_text(path.read_text() + "<style>.cta{background:#0fb48c}</style>")
 
     with TestClient(create_app(container.settings, container)) as client:
-        assert client.get(f"/api/pages/{page.page_id}/theme").json()["theme_color"] == "#0fb48c"
+        body = client.get(f"/api/pages/{page.page_id}/theme").json()
+        assert body["theme_color"] == "#0fb48c" and body["palette"] == ["#0fb48c"]
         path.write_text("<html></html>")  # stored value is reused, not recomputed
-        assert client.get(f"/api/pages/{page.page_id}/theme").json()["theme_color"] == "#0fb48c"
+        assert client.get(f"/api/pages/{page.page_id}/theme").json()["palette"] == ["#0fb48c"]
 
     await container.ingestion.ingest_upload("page.html", page_html.encode(), None)
     stored = await container.repo.get_page(page.page_id)
-    assert stored is not None and stored.theme_color is None
+    assert stored is not None and stored.theme_color is None and stored.theme_palette is None

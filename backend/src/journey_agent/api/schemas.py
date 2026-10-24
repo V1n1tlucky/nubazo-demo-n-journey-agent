@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -37,6 +37,7 @@ class AppConfig(BaseModel):
     model: str
     embedder: str
     browser_fetch: bool
+    guardrails: dict[str, Any]  # rules per check + LLM judge prompt templates (policy.py)
 
 
 class Health(BaseModel):

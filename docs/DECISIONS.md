@@ -66,6 +66,32 @@ EVAL=evals/<site>.json PAGE_ID=<id>` against the stored index, because live fetc
 different page variant (the Poonawalla page without its ad parameters has no eligibility
 section).
 
+### 5d. Retrieve-then-rerank, and one relevance decision, not three
+
+Customers saw fallbacks on most questions. Measured with 19 real questions on five sites, plus
+12 off-topic ones, the causes were the gates around FAISS, not FAISS itself:
+
+- **The cosine top-8 missed the right chunk.** Encrypted payloads (`iv: n5vB…`) and layout
+  debris ranked first by accident. Now FAISS proposes 3× top-k candidates, low-signal chunks
+  are dropped (at ingestion and at query time), and the cross-encoder ranks what the LLM sees.
+  Payloads also enter the prompt by rerank score, not cosine.
+- **Short questions were glued to the previous one.** "how do I apply?" became "is there any
+  processing fee? how do I apply?" and was refused. Now the question is scored as asked;
+  context (the previous question, or the greeting) is added only for real follow-ups ("yes…",
+  "and if…", ≤3 words). Measured: prefixing the greeting to *every* short question lifted
+  "who is the captain of India?" to rerank +6.4.
+- **Two relevance gates disagreed.** The LLM input judge refused "tell me about gold loan" on a
+  gold-loan lender's site. The judge now refuses only injection, harmful and abusive messages.
+  Relevance belongs to the rerank gate: at or above −4.65 passes, below −8 is refused, and in
+  between the judge's call breaks the tie.
+- **Embedding grounding blocked genuine paraphrases** at 0.55, which is also where an invented
+  answer scored. With the LLM output judge on, it only blocks below 0.45.
+
+Result: on-topic 16/19 → **19/19 answered**; off-topic **12/12 refused**, 10 of them at the gate in
+about 2 s. Note that 0.45 alone did let a Python script through (grounding 0.51) before the
+follow-up fix and the stricter output-judge prompt. The floor is not the safety boundary; the
+gate and the judges are.
+
 ### 5a. Reply language is chosen in code, not by the model
 
 Told only to "reply in the visitor's language", qwen2.5-7b answered "Tell me about 'Other
@@ -90,6 +116,40 @@ still drifted once in 12. **Built:**
 retrieval and the gate. 7B Hindi output is also noticeably weaker than its English, so a
 bigger model or human review of Hindi canned replies matters before a Hindi launch. The
 canned replies (off-page, fallback) are English-only today.
+
+### 5b. The company name is identified by the LLM at ingestion, and ingestion fails without it
+
+The assistant names the company in the greeting, chat header, refusals and system prompt, so
+the name must be right and the same everywhere. SEO titles are headlines ("Apply for Instant
+Pocket Loan Online | Fast Disbursal | Poonawalla Fincorp"), and an LLM asked for "the company"
+will invent one. **Built (company.py):**
+
+- **Candidates from the page.** Names come from og:site_name, the JSON-LD organisation, the
+  copyright line, title segments and logo alt text, ranked by agreement with the domain.
+- **The LLM names the company,** with the candidates as hints. The answer must be grounded:
+  a candidate, or text on the page. Otherwise there is one multiple-choice retry.
+- **No grounded answer, or no model, fails the load** (503 `llm_unavailable`) before anything is
+  written. Pages ingested earlier are identified on first use.
+
+The greeting is written by the LLM once per page, for that fixed company. It is
+customer-facing ("Hi, welcome to ICICI Bank! I can help you open an account…") and must never
+mention "page", "website" or "content". The same rule applies to every canned reply.
+
+### 5c. Guardrails are deterministic first, then an LLM judge
+
+Each guardrail node runs its deterministic checks first; they are fast and free, and a regex
+block never costs a model call. Messages and answers they let through then go to an **LLM
+judge**:
+
+- **Input judge:** prompt injection, harmful, abusive or unrelated.
+- **Output judge:** unsupported facts, unrelated advice, credential requests, instruction leaks
+  or promises.
+
+Judges **fail open**. An unreachable model or an unparseable reply is marked `skipped`, and the
+deterministic checks stand alone. On the local 7B model they add about 2–6 s per answered
+question, and they *save* time on unrelated questions, which are refused before retrieval
+(about 2 s). `JA_LLM_GUARDRAILS=false` turns them off. The console shows each check's rule
+(guardrails/policy.py) beside its live verdict, plus the exact judge prompt and raw reply.
 
 ## 6. Similarity-based grounding misses invented facts
 

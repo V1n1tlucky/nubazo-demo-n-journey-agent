@@ -31,7 +31,9 @@ class AgentState(TypedDict, total=False):
     page_id: str
     page_url: str
     page_title: str
-    company_name: str | None  # detected brand; canned replies name it instead of the title
+    company_name: str  # LLM-identified (company.py); every reply names this company
+    page_description: str
+    greeting: str  # the LLM greeting the customer saw; the conversation's opening turn
     topics: list[str]
     user_message: str
     persona_override: str | None
@@ -43,6 +45,7 @@ class AgentState(TypedDict, total=False):
     reply_language: str
     canned_reply: str | None
     history: list[tuple[str, str]]
+    judge_relevance: str | None  # LLM input judge: on_topic / unrelated / None
     content_hits: list[dict[str, Any]]
     payload_hits: list[dict[str, Any]]
     top_score: float

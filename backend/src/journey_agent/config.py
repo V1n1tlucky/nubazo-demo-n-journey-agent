@@ -57,7 +57,12 @@ class Settings(BaseSettings):
     relevance_threshold: float = 0.55  # cosine; below => off-page (used only without a reranker)
     # Cross-encoder gate (DECISIONS §5); "" disables it and falls back to the cosine gate.
     reranker_model: str = "BAAI/bge-reranker-base"
-    rerank_threshold: float = -4.65  # logit; below => off-page. Calibrated with `make eval`
+    rerank_threshold: float = -4.65  # logit; at or above => on-page. Calibrated with `make eval`
+    # Below this the question is off-page whatever the LLM input judge says; between the two
+    # thresholds the judge breaks the tie (see the retrieve node).
+    rerank_hard_threshold: float = -8.0
+    # FAISS returns this many times top_k candidates; the reranker picks the best of them.
+    candidate_pool: int = 3
     # Question languages the reranker can judge against the page; others use the cosine gate.
     # bge-reranker-base scores Hindi questions on an English page as off-page (evals/).
     reranker_languages: list[str] = Field(default_factory=lambda: ["English"])
@@ -66,8 +71,13 @@ class Settings(BaseSettings):
 
     # --- guardrails ---------------------------------------------------------
     max_input_chars: int = 1500
-    grounding_threshold: float = 0.58
+    grounding_threshold: float = 0.58  # embedding grounding when the LLM judges are off
+    # With LLM judges on, embedding similarity only blocks clearly off-base answers: genuine
+    # paraphrases and invented facts both score ~0.55, so the output judge decides above this.
+    grounding_floor: float = 0.45
     allow_prompt_override: bool = True  # demo console only; disable for embeds
+    # LLM-as-judge checks on the message (pre) and the answer (post); +2 model calls per turn.
+    llm_guardrails: bool = True
     # Languages the agent answers in; the visitor's message picks one, the first is the default.
     reply_languages: list[str] = Field(default_factory=lambda: ["English", "Hindi"], min_length=1)
 

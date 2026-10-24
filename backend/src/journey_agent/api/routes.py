@@ -14,9 +14,11 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from journey_agent.api.schemas import AppConfig, ChatRequest, Health, IngestRequest, NodeInfo
+from journey_agent.company import CompanyIdentificationError
 from journey_agent.container import Container
 from journey_agent.graph import prompts
 from journey_agent.graph.state import AgentState
+from journey_agent.guardrails.policy import guardrail_policy
 from journey_agent.ingestion.fetcher import FetchError, browser_available
 from journey_agent.ingestion.har import HarError
 from journey_agent.ingestion.service import NeedsUploadError
@@ -30,7 +32,7 @@ NODES = [
     NodeInfo(
         id="pre_guardrail",
         label="Pre-guardrail",
-        description="Length, prompt-injection, abuse, PII redaction, small-talk routing.",
+        description="Deterministic checks (length, injection, abuse, PII, small talk), then an LLM input judge.",
     ),
     NodeInfo(
         id="retrieve",
@@ -51,7 +53,7 @@ NODES = [
     NodeInfo(
         id="post_guardrail",
         label="Post-guardrail",
-        description="Prompt-leak, PII leak, link allow-list, grounding score.",
+        description="Deterministic checks (leaks, PII, links, numbers, grounding), then an LLM output judge.",
     ),
     NodeInfo(
         id="write",
@@ -82,6 +84,10 @@ def _needs_upload(detail: str) -> JSONResponse:
     return JSONResponse(status_code=422, content={"code": "needs_upload", "detail": detail})
 
 
+def _llm_unavailable(exc: CompanyIdentificationError) -> JSONResponse:
+    return JSONResponse(status_code=503, content={"code": "llm_unavailable", "detail": str(exc)})
+
+
 # --- meta -----------------------------------------------------------------------
 @router.get("/health", response_model=Health)
 async def health(c: Dep) -> Health:
@@ -104,6 +110,7 @@ async def config(c: Dep) -> AppConfig:
         model=c.llm.model,
         embedder=c.embedder.name,
         browser_fetch=browser_available(),
+        guardrails=guardrail_policy(c.settings),
     )
 
 
@@ -116,6 +123,8 @@ async def ingest_url(body: IngestRequest, c: Dep) -> PageRecord | JSONResponse:
         return JSONResponse(status_code=400, content={"code": "unsafe_url", "detail": str(exc)})
     except (FetchError, NeedsUploadError) as exc:
         return _needs_upload(str(exc))
+    except CompanyIdentificationError as exc:
+        return _llm_unavailable(exc)
 
 
 @router.post("/pages/upload", response_model=PageRecord)
@@ -135,6 +144,8 @@ async def ingest_upload(
         return JSONResponse(status_code=400, content={"code": "bad_request", "detail": str(exc)})
     except NeedsUploadError as exc:
         return _needs_upload(str(exc))
+    except CompanyIdentificationError as exc:
+        return _llm_unavailable(exc)
 
 
 @router.get("/pages", response_model=list[PageRecord])
@@ -173,21 +184,25 @@ async def page_snapshot(page_id: PageId, c: Dep) -> HTMLResponse:
 
 
 @router.get("/pages/{page_id}/theme")
-async def page_theme(page_id: PageId, c: Dep) -> dict[str, str | None]:
-    """The page's brand colour (`#rrggbb` or null), so the assistant can match the page."""
+async def page_theme(page_id: PageId, c: Dep) -> dict[str, Any]:
+    """The page's brand palette (primary first), so the assistant can wear the page's colours."""
     page = await c.repo.get_page(page_id)
     if page is None:
         raise HTTPException(404, "Unknown page.")
-    return {"page_id": page_id, "theme_color": await c.ingestion.theme_color(page)}
+    palette = await c.ingestion.theme_palette(page)
+    return {"page_id": page_id, "theme_color": palette[0] if palette else None, "palette": palette}
 
 
-@router.get("/pages/{page_id}/welcome")
-async def page_welcome(page_id: PageId, c: Dep) -> dict[str, str]:
+@router.get("/pages/{page_id}/welcome", response_model=None)
+async def page_welcome(page_id: PageId, c: Dep) -> dict[str, str] | JSONResponse:
     """The assistant's opening message and the company it names (LLM-written, cached)."""
     page = await c.repo.get_page(page_id)
     if page is None:
         raise HTTPException(404, "Unknown page.")
-    return (await c.welcome.welcome(page)).model_dump()
+    try:
+        return (await c.welcome.welcome(page)).model_dump()
+    except CompanyIdentificationError as exc:
+        return _llm_unavailable(exc)
 
 
 @router.get("/pages/{page_id}/chunks")
@@ -199,11 +214,15 @@ async def page_chunks(page_id: PageId, c: Dep) -> list[dict[str, Any]]:
 
 
 # --- chat -----------------------------------------------------------------------
-@router.post("/chat")
-async def chat(body: ChatRequest, c: Dep) -> EventSourceResponse:
+@router.post("/chat", response_model=None)
+async def chat(body: ChatRequest, c: Dep) -> EventSourceResponse | JSONResponse:
     page = await c.repo.get_page(body.page_id)
     if page is None:
         raise HTTPException(404, "Unknown page — ingest it first.")
+    try:
+        page = await c.ingestion.ensure_company(page)  # pages ingested before it was required
+    except CompanyIdentificationError as exc:
+        return _llm_unavailable(exc)
 
     run_id = uuid.uuid4().hex
     state: AgentState = {
@@ -212,7 +231,9 @@ async def chat(body: ChatRequest, c: Dep) -> EventSourceResponse:
         "page_id": page.page_id,
         "page_url": page.url,
         "page_title": page.title,
-        "company_name": page.company_name,
+        "company_name": page.company_name or page.title,  # ensure_company has set it
+        "page_description": page.description,
+        "greeting": page.welcome_message or "",
         "topics": page.topics,
         "user_message": body.message,
         "persona_override": body.persona_override,

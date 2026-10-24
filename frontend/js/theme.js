@@ -1,7 +1,13 @@
-// Page theming for the assistant: accent colours derived from the page's brand colour
-// (GET /api/pages/{id}/theme) and a Lottie mascot recoloured to match it.
+// Page theming for the assistant: the page's brand palette (GET /api/pages/{id}/theme,
+// primary first) drives the chat's accent colours and recolours the Lottie mascot.
 
-const VARS = ["--bot-accent", "--bot-accent-deep", "--bot-on-accent", "--bot-glow"];
+const VARS = ["--bot-accent", "--bot-accent-deep", "--bot-on-accent", "--bot-glow", "--bot-accent-2", "--bot-accent-3"];
+
+/** Primary / secondary / accent from a palette of 0–3 colours; missing roles reuse the last. */
+export function paletteRoles(palette) {
+  const p = (palette ?? []).filter(Boolean);
+  return p.length ? { primary: p[0], secondary: p[1] ?? p[0], accent: p[2] ?? p[1] ?? p[0] } : null;
+}
 
 function hexToRgb(hex) {
   const n = parseInt(hex.slice(1), 16);
@@ -47,12 +53,16 @@ const contrast = (a, b) => {
   return (hi + 0.05) / (lo + 0.05);
 };
 
-/** Set the assistant's accent CSS variables on `el`; `null` restores the console defaults. */
-export function applyChatTheme(el, hex) {
-  if (!hex) {
+/** Set the assistant's palette CSS variables on `el`; an empty palette restores the defaults. */
+export function applyChatTheme(el, palette) {
+  const roles = paletteRoles(palette);
+  if (!roles) {
     VARS.forEach((v) => el.style.removeProperty(v));
     return;
   }
+  const hex = roles.primary;
+  el.style.setProperty("--bot-accent-2", roles.secondary);
+  el.style.setProperty("--bot-accent-3", roles.accent);
   const rgb = hexToRgb(hex);
   const [h, s, l] = rgbToHsl(...rgb.map((c) => c / 255));
   const deep = hslToRgb(h, s, Math.max(0, l - 0.12)).map((c) => Math.round(c * 255));
@@ -63,24 +73,33 @@ export function applyChatTheme(el, hex) {
   el.style.setProperty("--bot-glow", `rgba(${rgb.join(", ")}, .38)`);
 }
 
+// Which palette role each part of assets/chatbot.json takes, by its layer name.
+// The robot (head, body, hands, tail, ears, face screen) is primary; the chat bubbles
+// and their dots are secondary; the glowing cyan eyes, mic and highlights are accent.
+const SECONDARY_LAYERS = /^(chat|rectangle)\b/i;
+const isGlow = (h, l) => h >= 170 / 360 && h <= 190 / 360 && l > 0.65;
+
 /**
- * Recolour a Lottie animation in place (pass a fresh copy): every saturated colour moves to the theme's hue.
- * Lightness is kept so the shading and highlights still read; whites, greys and the
- * near-black outline keep their tone.
+ * Recolour a Lottie animation in place (pass a fresh copy) with the page's palette.
+ * Each part takes its role's hue and saturation but keeps its own lightness, so the
+ * gradients and highlights still read; whites, greys and the dark outline stay as drawn.
  */
-export function tintAnimation(data, hex) {
-  const [th, ts] = rgbToHsl(...hexToRgb(hex).map((c) => c / 255));
-  const tint = (r, g, b) => {
-    const [, s, l] = rgbToHsl(r, g, b);
+export function tintAnimation(data, palette) {
+  const roles = paletteRoles(palette);
+  if (!roles) return data;
+  const hsl = Object.fromEntries(Object.entries(roles).map(([k, hex]) => [k, rgbToHsl(...hexToRgb(hex).map((c) => c / 255))]));
+  const tint = (r, g, b, role) => {
+    const [h, s, l] = rgbToHsl(r, g, b);
     if (s < 0.2 || l < 0.15 || l > 0.95) return [r, g, b];
+    const [th, ts] = hsl[role === "primary" && isGlow(h, l) ? "accent" : role];
     return hslToRgb(th, Math.min(1, 0.8 * ts + 0.2 * s), l);
   };
-  const tintRgba = (arr) => [...tint(arr[0], arr[1], arr[2]), ...arr.slice(3)];
-  const tintStops = (arr, stops) => {
+  const tintRgba = (role) => (arr) => [...tint(arr[0], arr[1], arr[2], role), ...arr.slice(3)];
+  const tintStops = (stops, role) => (arr) => {
     const out = [...arr];
     for (let i = 0; i < stops; i++) {
       const j = i * 4 + 1; // [offset, r, g, b] per colour stop; opacity stops follow
-      [out[j], out[j + 1], out[j + 2]] = tint(out[j], out[j + 1], out[j + 2]);
+      [out[j], out[j + 1], out[j + 2]] = tint(out[j], out[j + 1], out[j + 2], role);
     }
     return out;
   };
@@ -95,13 +114,14 @@ export function tintAnimation(data, hex) {
       prop.k = fn(prop.k);
     }
   };
-  const walk = (o) => {
-    if (Array.isArray(o)) { o.forEach(walk); return; }
+  const walk = (o, role) => {
+    if (Array.isArray(o)) { o.forEach((v) => walk(v, role)); return; }
     if (!o || typeof o !== "object") return;
-    if ((o.ty === "fl" || o.ty === "st") && o.c) eachValue(o.c, tintRgba);
-    if ((o.ty === "gf" || o.ty === "gs") && o.g) eachValue(o.g.k, (arr) => tintStops(arr, o.g.p));
-    Object.values(o).forEach(walk);
+    if (typeof o.ty === "number") role = SECONDARY_LAYERS.test(o.nm ?? "") ? "secondary" : "primary"; // a layer
+    if ((o.ty === "fl" || o.ty === "st") && o.c) eachValue(o.c, tintRgba(role));
+    if ((o.ty === "gf" || o.ty === "gs") && o.g) eachValue(o.g.k, tintStops(o.g.p, role));
+    Object.values(o).forEach((v) => walk(v, role));
   };
-  walk(data);
+  walk(data, "primary");
   return data;
 }

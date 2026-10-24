@@ -12,7 +12,7 @@ from tests.fakes import HashEmbedder
 
 
 def pre(text: str):  # type: ignore[no-untyped-def]
-    return run_pre_guardrails(text, max_chars=200, page_title="Acme", topics=["Eligibility"])
+    return run_pre_guardrails(text, max_chars=200, company="Acme", topics=["Eligibility"])
 
 
 class TestPii:

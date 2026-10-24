@@ -9,15 +9,17 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
+from journey_agent.company import identify_company
 from journey_agent.config import Settings
 from journey_agent.ingestion.chunker import chunk_document
 from journey_agent.ingestion.extractor import extract
 from journey_agent.ingestion.fetcher import browser_available, fetch_page
 from journey_agent.ingestion.har import parse_har
-from journey_agent.ingestion.models import RawPage, SourceType
+from journey_agent.ingestion.models import Chunk, RawPage, SourceType
 from journey_agent.ingestion.snapshot import sanitize_snapshot
 from journey_agent.ingestion.theme import theme_from_html, theme_from_snapshot
 from journey_agent.ingestion.url_safety import normalize_url
+from journey_agent.llm.client import ChatModel
 from journey_agent.persistence.repository import PageRecord, Repository
 from journey_agent.rag.store import IndexRegistry
 
@@ -33,33 +35,57 @@ class IngestionService:
     settings: Settings
     registry: IndexRegistry
     repo: Repository
+    llm: ChatModel  # company identification is a required step of ingestion
 
     def snapshot_path(self, page_id: str) -> Path:
         return self.settings.snapshot_dir / f"{page_id}.html"
 
-    async def theme_color(self, page: PageRecord) -> str | None:
-        """The page's brand colour, computed from its snapshot on first request and stored."""
-        if page.theme_color is not None:
-            return page.theme_color or None
+    async def ensure_company(self, page: PageRecord) -> PageRecord:
+        """Pages ingested before identification was required get it on first use.
+
+        Raises CompanyIdentificationError, like ingestion does.
+        """
+        if page.company_name:
+            return page
+        path = self.snapshot_path(page.page_id)
+        html = await asyncio.to_thread(path.read_text, "utf-8") if path.is_file() else ""
+        index = await self.registry.get(page.page_id)
+        chunks = index.chunks if index else []
+        company = await identify_company(
+            self.llm,
+            url=page.url,
+            title=page.title,
+            description=page.description,
+            excerpt=_excerpt(chunks),
+            html=html,
+            meta_chunks=[c for c in chunks if c.source is SourceType.META],
+        )
+        await self.repo.set_company(page.page_id, company)
+        return page.model_copy(update={"company_name": company, "welcome_message": None})
+
+    async def theme_palette(self, page: PageRecord) -> list[str]:
+        """The page's brand palette (primary first), computed from its snapshot once and stored."""
+        if page.theme_palette is not None:
+            return [c for c in page.theme_palette.split(",") if c]
         path = self.snapshot_path(page.page_id)
         if not path.is_file():
-            return None
+            return []
         html = await asyncio.to_thread(path.read_text, "utf-8")
-        color: str | None = None
+        palette: list[str] = []
         if browser_available():
             try:
-                color = await theme_from_snapshot(
+                palette = await theme_from_snapshot(
                     html,
                     timeout_s=self.settings.fetch_timeout_s,
                     allow_private=self.settings.allow_private_urls,
                 )
             except Exception as exc:  # Chromium not downloaded, page too slow, …
                 log.warning("event=theme_browser_failed page_id=%s error=%s", page.page_id, exc)
-        if color is None:
-            color = await asyncio.to_thread(theme_from_html, html)
-        await self.repo.set_theme_color(page.page_id, color or "")
-        log.info("event=theme_detected page_id=%s color=%s", page.page_id, color)
-        return color
+        if not palette:
+            palette = await asyncio.to_thread(theme_from_html, html)
+        await self.repo.set_theme(page.page_id, palette)
+        log.info("event=theme_detected page_id=%s palette=%s", page.page_id, palette)
+        return palette
 
     async def ingest_url(self, url: str) -> PageRecord:
         s = self.settings
@@ -103,6 +129,17 @@ class IngestionService:
         if not chunks:
             raise NeedsUploadError("No readable text found on this page.")
 
+        # Before anything is written: no LLM-identified company, no page.
+        company = await identify_company(
+            self.llm,
+            url=doc.url,
+            title=doc.title,
+            description=doc.description,
+            excerpt=_excerpt(chunks),
+            html=raw.html,  # the original, with JSON-LD and meta tags the snapshot drops
+            meta_chunks=[c for c in chunks if c.source is SourceType.META],
+        )
+
         await self.registry.put(doc.page_id, chunks)
         snapshot = await asyncio.to_thread(sanitize_snapshot, raw.html, raw.url)
         path = self.snapshot_path(doc.page_id)
@@ -119,6 +156,7 @@ class IngestionService:
             char_count=doc.char_count,
             payload_count=len(raw.payloads),
             topics=doc.topics,
+            company_name=company,
         )
         await self.repo.upsert_page(record)
         log.info(
@@ -130,6 +168,10 @@ class IngestionService:
             doc.fetched_with,
         )
         return await self.repo.get_page(doc.page_id) or record
+
+
+def _excerpt(chunks: list[Chunk]) -> str:
+    return "\n".join(c.text for c in chunks if c.source is SourceType.CONTENT)[:4000]
 
 
 def _canonical_url(html: str) -> str | None:
