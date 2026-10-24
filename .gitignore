@@ -1,0 +1,17 @@
+# Python / uv
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+dist/
+
+# Runtime data: SQLite DB, FAISS indexes, page snapshots (may contain customer text)
+backend/data/
+
+# Local config & scratch
+.env
+.scratch/
+.DS_Store

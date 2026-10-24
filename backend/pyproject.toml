@@ -1,0 +1,69 @@
+[project]
+name = "journey-agent"
+version = "0.1.0"
+description = "Local, page-scoped customer assistant: LangGraph + FAISS RAG + guardrails on an open-source LLM"
+authors = [
+    { name = "Vinit Gupta", email = "gvinit37@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "faiss-cpu>=1.15.1",
+    "fastapi>=0.151.0",
+    "fastembed>=0.9.0",
+    "httpx>=0.28.1",
+    "langgraph>=1.2.16",
+    "lingua-language-detector>=2.2",
+    "lxml>=6.1.3",
+    "numpy>=2.5.4",
+    "openai>=3.35.1",
+    "pydantic-settings>=2.16.1",
+    "python-multipart>=0.0.32",
+    "sse-starlette>=3.5.0",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+journey-agent = "journey_agent:main"
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.64.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4.0",
+    "pre-commit>=4.7.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "respx>=0.23.1",
+    "ruff>=0.17.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "S", "RUF"]
+# E501: `ruff format` owns line length; long prompt/regex literals are left intact.
+ignore = ["E501", "S101", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]

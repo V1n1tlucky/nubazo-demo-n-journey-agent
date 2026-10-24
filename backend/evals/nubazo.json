@@ -1,0 +1,25 @@
+{
+  "url": "https://nubazo.com/",
+  "on_topic": [
+    "What does Nubazo do?",
+    "Do we need to adopt all nine modules at once?",
+    "Is it suitable for NBFCs?",
+    "How does credit policy optimisation work?",
+    "What security controls do you have?",
+    "How can I book a demo?",
+    "What modules are there?",
+    "Do your AI agents have guardrails?",
+    "Which channels can campaigns run on?",
+    "What is maker-checker approval?"
+  ],
+  "off_topic": [
+    "What is the capital of France?",
+    "Write me a python script to sort a list",
+    "Who won the cricket world cup?",
+    "Recommend a good pizza place",
+    "What's the weather tomorrow?",
+    "Explain quantum entanglement",
+    "What is the current repo rate in India?",
+    "Tell me a joke"
+  ]
+}
